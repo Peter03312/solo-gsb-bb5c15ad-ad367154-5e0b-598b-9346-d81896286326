@@ -73,6 +73,18 @@ CREATE TABLE IF NOT EXISTS publications (
     published_by INTEGER NOT NULL REFERENCES users(id),
     created_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 发布记录撤稿：作者先发起（非空原因），再由另一名非作者审阅人确认。
+-- confirmed_by/confirmed_at 为空表示仍在待确认；确认不回滚版本或审阅结论。
+CREATE TABLE IF NOT EXISTS publication_retractions (
+    publication_id INTEGER PRIMARY KEY REFERENCES publications(id),
+    reason         TEXT NOT NULL,
+    snapshot_sha   TEXT NOT NULL,
+    requested_by   INTEGER NOT NULL REFERENCES users(id),
+    requested_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    confirmed_by   INTEGER REFERENCES users(id),
+    confirmed_at   TEXT
+);
 """
 
 

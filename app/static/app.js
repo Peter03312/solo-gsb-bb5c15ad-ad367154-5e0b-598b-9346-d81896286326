@@ -3,7 +3,7 @@
 
 const $app = document.getElementById("app");
 let me = null;
-let current = { view: "todo", docId: null, versionId: null, detail: null };
+let current = { view: "todo", docId: null, versionId: null, pubId: null, detail: null };
 let selection = null; // {start_cp, end_cp} 码位区间
 
 /* ---------- 工具 ---------- */
@@ -77,7 +77,7 @@ async function boot() {
 }
 
 function go(view, opts) {
-  current = { view, docId: opts?.docId || null, versionId: opts?.versionId || null, detail: null };
+  current = { view, docId: opts?.docId || null, versionId: opts?.versionId || null, pubId: opts?.pubId || null, detail: null };
   selection = null;
   document.querySelectorAll(".topbar nav button").forEach(b =>
     b.classList.toggle("active", b.dataset.view === view));
@@ -85,6 +85,7 @@ function go(view, opts) {
   else if (view === "documents") renderDocuments();
   else if (view === "new") renderNewDocument();
   else if (view === "pubs") renderPublications();
+  else if (view === "publication") renderPublication(opts.pubId);
   else if (view === "doc") renderDocument(opts.docId);
   else if (view === "version") renderVersion(opts.docId, opts.versionId);
 }
@@ -95,6 +96,7 @@ async function reloadCurrent() {
   else if (current.view === "todo") await renderTodo();
   else if (current.view === "documents") await renderDocuments();
   else if (current.view === "pubs") await renderPublications();
+  else if (current.view === "publication") await renderPublication(current.pubId);
 }
 
 /* ---------- 登录页 ---------- */
@@ -169,7 +171,11 @@ function setMain(html) { mainEl().innerHTML = html; }
 /* ---------- 待办 ---------- */
 
 async function renderTodo() {
-  const data = await api("GET", "/api/todos");
+  const [data, pubs] = await Promise.all([
+    api("GET", "/api/todos"),
+    me.role === "reviewer" ? api("GET", "/api/publications") : Promise.resolve([]),
+  ]);
+  const pendingRetractions = pubs.filter(p => p.can_confirm_retraction);
   const m = mainEl();
   if (me.role === "reviewer") {
     m.innerHTML = `
@@ -211,6 +217,19 @@ async function renderTodo() {
             </td>
           </tr>`).join("")}
         </tbody></table>` : `<p class="muted">没有待确认的版本（全部提议裁决后才需要确认）。</p>`}
+      </div>
+      <div class="panel">
+        <h2>待我确认的撤稿</h2>
+        ${pendingRetractions.length ? `
+        <table><thead><tr><th>文稿</th><th>版本</th><th>发起人</th><th>撤稿原因</th><th></th></tr></thead><tbody>
+        ${pendingRetractions.map(p => `
+          <tr>
+            <td class="clickable" data-act="open-publication" data-pid="${p.id}">${esc(p.document_title)}</td>
+            <td>v${p.version_no}</td><td>${esc(p.retraction.requested_by_name)}</td>
+            <td>${esc(p.retraction.reason)}</td>
+            <td><button class="btn btn-sm btn-danger" data-act="open-publication" data-pid="${p.id}">查看快照并确认</button></td>
+          </tr>`).join("")}
+        </tbody></table>` : `<p class="muted">暂无待确认的撤稿申请。</p>`}
       </div>`;
   } else {
     const rows = data.ready_to_publish;
@@ -237,6 +256,12 @@ async function renderTodo() {
 
 /* ---------- 文稿列表 ---------- */
 
+function documentStatusBadge(d) {
+  if (!d.head_published_at) return '<span class="badge badge-pending">处理中</span>';
+  if (d.head_retracted) return '<span class="badge badge-retracted">已撤稿</span>';
+  return '<span class="badge badge-published">已发布</span>';
+}
+
 async function renderDocuments() {
   const docs = await api("GET", "/api/documents");
   setMain(`
@@ -248,7 +273,7 @@ async function renderDocuments() {
       <tr class="clickable" data-act="open-doc" data-id="${d.id}">
         <td>${esc(d.title)}</td><td>${esc(d.author_name)}</td>
         <td>v${d.head_version_no || "-"}</td><td>${d.version_count}</td>
-        <td>${d.head_published_at ? '<span class="badge badge-published">已发布</span>' : '<span class="badge badge-pending">处理中</span>'}</td>
+        <td>${documentStatusBadge(d)}</td>
         <td>${fmt(d.created_at)}</td>
       </tr>`).join("")}
     </tbody></table>` : `<p class="muted">还没有文稿。${me.role === "author" ? '点击顶部“新建文稿”开始。' : ""}</p>`}
@@ -283,6 +308,13 @@ function renderNewDocument() {
 
 /* ---------- 文稿详情（版本列表 + 新版本） ---------- */
 
+function publicationVersionBadge(v) {
+  if (!v.published_at) return "未发布";
+  if (v.retraction_confirmed_at) return '<span class="badge badge-retracted">已撤稿</span>';
+  if (v.retraction_reason) return '<span class="badge badge-pending">撤稿待确认</span>';
+  return '<span class="badge badge-published">已发布</span>';
+}
+
 async function renderDocument(docId) {
   const doc = await api("GET", `/api/documents/${docId}`);
   const canCreate = me.role === "author" && me.id === doc.author_id;
@@ -304,7 +336,7 @@ async function renderDocument(docId) {
     ${doc.versions.map(v => `
       <tr class="clickable" data-act="open-version" data-doc="${doc.id}" data-v="${v.id}">
         <td>v${v.version_no} ${v.id === doc.head_version_id ? '<span class="badge badge-head">当前</span>' : ""}</td>
-        <td>${v.published_at ? '<span class="badge badge-published">已发布</span>' : "未发布"}</td>
+        <td>${publicationVersionBadge(v)}</td>
         <td>${v.pending_count || 0}</td><td>${v.accepted_count || 0}</td>
         <td>${v.content_len}</td><td>${fmt(v.created_at)}</td>
       </tr>`).join("")}
@@ -344,7 +376,12 @@ async function renderVersion(docId, vid, isReload) {
   const isReviewer = me.role === "reviewer";
   const canSelect = isReviewer && detail.is_head && !detail.published_at;
 
-  const statusBadge = detail.published_at
+  const publicationStatus = detail.publication?.status;
+  const statusBadge = publicationStatus === "retracted"
+    ? `<span class="badge badge-retracted">已撤稿 ${fmt(detail.publication.retraction.confirmed_at)}</span>`
+    : publicationStatus === "retraction_pending"
+    ? `<span class="badge badge-pending">撤稿待确认</span>`
+    : detail.published_at
     ? `<span class="badge badge-published">已发布 ${fmt(detail.published_at)}</span>`
     : detail.is_head ? `<span class="badge badge-head">当前版本</span>`
     : `<span class="badge badge-rejected">历史版本（只读）</span>`;
@@ -356,7 +393,7 @@ async function renderVersion(docId, vid, isReload) {
       ${doc.versions.map(v => `
         <button class="ver-tab ${v.id === vid ? "active" : ""}"
           data-act="open-version" data-doc="${docId}" data-v="${v.id}">
-          v${v.version_no}${v.published_at ? " ✓" : ""}
+          v${v.version_no}${v.retraction_confirmed_at ? " ⌫" : v.retraction_reason ? " ⏳" : v.published_at ? " ✓" : ""}
         </button>`).join("")}
     </div>
     <p class="muted small">正文长度：${detail.content_length} 个 Unicode 码位 ・ 裁决状态版本号 <code class="k">rev=${detail.state_rev}</code> ・ 创建于 ${fmt(detail.created_at)}
@@ -392,7 +429,7 @@ async function renderVersion(docId, vid, isReload) {
         <pre class="preview-pre">${esc(detail.masked_preview)}</pre>
         <p class="small muted">预览指纹 <code class="k">${detail.preview_sha.slice(0, 16)}…</code></p>
         <p>
-          <a class="btn btn-sm" href="/api/versions/${vid}/export">⬇ 导出遮盖文本（仅含遮盖后内容）</a>
+          ${renderVersionExport(detail)}
           ${detail.pending_count > 0 ? `<span class="small" style="color:var(--warn)">（${detail.pending_count} 条未裁决，尚不能导出最终稿）</span>` : ""}
         </p>
       </div>
@@ -414,6 +451,15 @@ async function renderVersion(docId, vid, isReload) {
       window.getSelection()?.removeAllRanges();
     });
   }
+}
+
+function renderVersionExport(detail) {
+  if (detail.publication?.status === "retracted")
+    return `<span class="badge badge-retracted">已撤稿，原导出入口已停用</span>
+            <a class="btn btn-sm" data-act="open-publication" data-pid="${detail.publication.id}">查看历史快照</a>`;
+  const note = detail.publication?.status === "retraction_pending"
+    ? `<span class="small" style="color:var(--warn)">撤稿待确认；确认前仍可下载。</span>` : "";
+  return `<a class="btn btn-sm" href="/api/versions/${detail.id}/export">⬇ 导出遮盖文本（仅含遮盖后内容）</a>${note}`;
 }
 
 function renderProposals(detail) {
@@ -461,8 +507,23 @@ function renderConfirmPanel(detail) {
     </li>`).join("");
   const rev = detail.state_rev;
   let action = "";
-  if (detail.published_at) {
-    action = `<div class="notice notice-ok">✅ 该版本已于 ${fmt(detail.published_at)} 发布，导出内容即为最终脱敏稿。</div>`;
+  if (detail.publication?.status === "retracted") {
+    const r = detail.publication.retraction;
+    action = `<div class="notice notice-bad">
+        此发布稿已撤稿（${fmt(r.confirmed_at)}）。撤稿不回滚版本或审阅结论；如需重新发布，请创建新版本并重新完成确认。
+      </div>
+      <div class="small muted">原因：${esc(r.reason)}<br>发起人：${esc(r.requested_by_name)} ・ 确认人：${esc(r.confirmed_by_name)}</div>
+      <p><a class="btn btn-sm" data-act="open-publication" data-pid="${detail.publication.id}">查看保留的历史快照</a></p>`;
+  } else if (detail.publication?.status === "retraction_pending") {
+    const r = detail.publication.retraction;
+    action = `<div class="notice notice-warn">
+        撤稿申请待另一名非作者审阅人确认；确认前发布记录仍有效。
+      </div>
+      <div class="small muted">原因：${esc(r.reason)}<br>发起人：${esc(r.requested_by_name)} ・ ${fmt(r.requested_at)}</div>
+      <p><a class="btn btn-sm" data-act="open-publication" data-pid="${detail.publication.id}">查看发布记录</a></p>`;
+  } else if (detail.published_at) {
+    action = `<div class="notice notice-ok">✅ 该版本已于 ${fmt(detail.published_at)} 发布，导出内容即为最终脱敏稿。</div>
+      ${detail.publication?.can_request_retraction ? `<button class="btn btn-sm btn-danger" data-act="open-publication" data-pid="${detail.publication.id}">发起撤稿</button>` : ""}`;
   } else if (detail.pending_count > 0) {
     action = `<div class="notice notice-warn">尚有 ${detail.pending_count} 条提议未裁决；全部裁决后才能确认与发布。</div>`;
   } else if (me.role === "reviewer" && detail.can_confirm) {
@@ -513,21 +574,105 @@ function onSourceSelection(pre, detail) {
 
 /* ---------- 发布记录 ---------- */
 
+function publicationBadge(p) {
+  if (p.status === "retracted") return '<span class="badge badge-retracted">已撤稿</span>';
+  if (p.status === "retraction_pending") return '<span class="badge badge-pending">撤稿待确认</span>';
+  return '<span class="badge badge-published">可用</span>';
+}
+
+function publicationExportCell(p) {
+  if (p.status === "retracted") return '<span class="small muted">已停用下载，可查看历史快照</span>';
+  return `<a class="btn btn-sm" href="/api/versions/${p.version_id}/export">⬇ 导出脱敏文本</a>`;
+}
+
 async function renderPublications() {
   const rows = await api("GET", "/api/publications");
   setMain(`
   <div class="panel">
     <h2>发布记录</h2>
     ${rows.length ? `
-    <table><thead><tr><th>文稿</th><th>版本</th><th>发布人</th><th>发布时间</th><th></th></tr></thead><tbody>
+    <table><thead><tr><th>状态</th><th>文稿</th><th>版本</th><th>发布人</th><th>发布时间</th><th>导出 / 记录</th></tr></thead><tbody>
     ${rows.map(r => `
       <tr>
-        <td>${esc(r.document_title)}</td><td>v${r.version_no}</td>
-        <td>${esc(r.published_by_name)}</td><td>${fmt(r.created_at)}</td>
-        <td><a class="btn btn-sm" href="/api/versions/${r.version_id}/export">⬇ 导出脱敏文本</a></td>
+        <td>${publicationBadge(r)}</td><td>${esc(r.document_title)}</td><td>v${r.version_no}</td>
+        <td>${esc(r.published_by_name)}</td><td>${fmt(r.published_at)}</td>
+        <td>
+          ${publicationExportCell(r)}
+          <button class="btn btn-sm" data-act="open-publication" data-pid="${r.id}">查看记录</button>
+        </td>
       </tr>`).join("")}
     </tbody></table>` : `<p class="muted">暂无发布记录。</p>`}
   </div>`);
+}
+
+async function renderPublication(pid) {
+  const p = await api("GET", `/api/publications/${pid}`);
+  current.pubId = pid;
+  current.detail = p;
+  const r = p.retraction;
+  const retractionPanel = r ? `
+    <div class="panel ${r.status === "confirmed" ? "retracted-panel" : "pending-panel"}">
+      <h3>${r.status === "confirmed" ? "撤稿记录" : "撤稿申请（待另一名非作者审阅人确认）"}</h3>
+      <div class="retraction-meta">
+        <span><b>原因：</b>${esc(r.reason)}</span>
+        <span><b>发起人：</b>${esc(r.requested_by_name)} ・ ${fmt(r.requested_at)}</span>
+        ${r.status === "confirmed"
+          ? `<span><b>确认人：</b>${esc(r.confirmed_by_name)} ・ ${fmt(r.confirmed_at)}</span>`
+          : `<span class="muted">作者不能自批；确认前此记录仍可下载。</span>`}
+      </div>
+      ${r.status === "confirmed"
+        ? `<div class="notice notice-bad">已从当前可用发布稿移除；撤稿不回滚版本或审阅结论。重新发布必须创建新版本并重新完成原有审阅确认。</div>
+           <button class="btn btn-sm" data-act="open-doc" data-id="${p.document_id}">去创建新版本以重新发布</button>`
+        : ""}
+      ${p.can_confirm_retraction ? `<button class="btn btn-danger" id="confirm-retraction-btn" data-sha="${r.snapshot_sha}">我已查看脱敏快照，确认撤稿</button>` : ""}
+    </div>` : `
+    <div class="panel">
+      <h3>撤稿</h3>
+      ${p.can_request_retraction ? `
+        <p class="muted small">若发现已发布脱敏稿仍含敏感信息，请填写非空撤稿原因。提交后须由另一名非作者审阅人查看快照并确认。</p>
+        <div class="field"><label>撤稿原因</label><textarea id="retraction-reason" maxlength="1000" placeholder="说明仍需撤稿的敏感信息风险"></textarea></div>
+        <button class="btn btn-danger" id="request-retraction-btn">发起撤稿</button>`
+        : `<p class="muted">只有文稿作者可对可用发布记录发起撤稿。</p>`}
+    </div>`;
+
+  setMain(`
+  <div class="panel">
+    <h2>${publicationBadge(p)} ${esc(p.document_title)} · v${p.version_no}</h2>
+    <p class="muted small">
+      发布人：${esc(p.published_by_name)} ・ 发布于 ${fmt(p.published_at)} ・
+      快照指纹 <code class="k">${esc(p.snapshot_sha)}</code>
+    </p>
+    <p>
+      <button class="btn btn-sm" data-act="open-version" data-doc="${p.document_id}" data-v="${p.version_id}">查看版本工作台</button>
+      ${p.available ? `<a class="btn btn-sm" href="/api/versions/${p.version_id}/export">⬇ 导出此发布稿</a>`
+        : '<span class="badge badge-retracted">原导出入口不可用</span>'}
+    </p>
+  </div>
+  ${retractionPanel}
+  <div class="panel">
+    <h3>发布时脱敏快照（仅含遮盖后内容）</h3>
+    <pre class="preview-pre">${esc(p.masked_text)}</pre>
+    <p class="small muted">快照长度：${p.masked_text_length} 个 Unicode 码位。历史记录保留供登录用户追溯，页面任何情况下都不展示原文。</p>
+  </div>`);
+
+  const reqBtn = document.getElementById("request-retraction-btn");
+  if (reqBtn) {
+    reqBtn.addEventListener("click", async () => {
+      const reason = document.getElementById("retraction-reason").value.trim();
+      if (!reason) return toast("撤稿原因不能为空", "bad");
+      await mutate("POST", `/api/publications/${pid}/retraction`, { reason },
+        "撤稿申请已发起，等待另一名非作者审阅人确认",
+        { after: async () => renderPublication(pid), stale: async () => renderPublication(pid) });
+    });
+  }
+  const conBtn = document.getElementById("confirm-retraction-btn");
+  if (conBtn) {
+    conBtn.addEventListener("click", async () => {
+      await mutate("POST", `/api/publications/${pid}/retraction/confirm`,
+        { snapshot_sha: conBtn.dataset.sha }, "已确认撤稿，发布记录已标记为撤稿",
+        { after: async () => renderPublication(pid), stale: async () => renderPublication(pid) });
+    });
+  }
 }
 
 /* ---------- 统一操作处理 ---------- */
@@ -554,6 +699,9 @@ document.addEventListener("click", async (e) => {
   } else if (act === "open-version") {
     e.preventDefault();
     go("version", { docId: Number(el.dataset.doc), versionId: Number(el.dataset.v) });
+  } else if (act === "open-publication") {
+    e.preventDefault();
+    go("publication", { pubId: Number(el.dataset.pid) });
   } else if (act === "submit-proposal") {
     e.preventDefault();
     if (!selection) return toast("请先在正文中拖选要遮盖的文字", "bad");

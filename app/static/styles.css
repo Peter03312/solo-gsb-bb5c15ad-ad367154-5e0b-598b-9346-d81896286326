@@ -89,6 +89,7 @@ input, textarea, select { font: inherit; }
 .badge-rejected { background: #e5e7eb; color: #4b5563; }
 .badge-withdrawn { background: #fce7f3; color: #9d174d; text-decoration: line-through; }
 .badge-published { background: var(--ok-bg); color: var(--ok); }
+.badge-retracted { background: var(--bad-bg); color: var(--bad); }
 .badge-head { background: var(--info-bg); color: #1e40af; }
 
 table { width: 100%; border-collapse: collapse; }
@@ -150,6 +151,12 @@ tr.clickable:hover { background: #f8fafc; }
 .notice-warn { background: var(--warn-bg); color: var(--warn); }
 .notice-ok { background: var(--ok-bg); color: var(--ok); }
 .notice-bad { background: var(--bad-bg); color: var(--bad); }
+.retraction-meta {
+  display: flex; flex-direction: column; gap: 4px;
+  border-left: 3px solid var(--bad); padding: 4px 0 4px 10px; margin: 8px 0 12px;
+}
+.retracted-panel { border-color: #fca5a5; }
+.pending-panel { border-color: #fcd34d; }
 
 #toast {
   position: fixed; right: 18px; bottom: 18px; z-index: 99;

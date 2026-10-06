@@ -37,4 +37,9 @@ def apply_mask(text: str, ranges: list[tuple[int, int]]) -> str:
 
 def preview_hash(text: str, ranges: list[tuple[int, int]]) -> str:
     """最终预览内容的稳定指纹：确认与发布必须指向同一份预览。"""
-    return hashlib.sha256(apply_mask(text, ranges).encode("utf-8")).hexdigest()
+    return text_hash(apply_mask(text, ranges))
+
+
+def text_hash(text: str) -> str:
+    """文本快照的稳定指纹。"""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
