@@ -79,6 +79,7 @@ input, textarea, select { font: inherit; }
 .btn-ok { background: var(--ok); border-color: var(--ok); color: #fff; }
 .btn-danger { background: var(--bad); border-color: var(--bad); color: #fff; }
 .btn-sm { padding: 3px 10px; font-size: 12px; }
+.btn.is-disabled, a.btn.is-disabled { opacity: .55; cursor: not-allowed; text-decoration: none; color: var(--muted); }
 
 .badge {
   display: inline-block; border-radius: 999px; padding: 1px 10px;
@@ -87,6 +88,7 @@ input, textarea, select { font: inherit; }
 .badge-pending { background: var(--warn-bg); color: var(--warn); }
 .badge-accepted { background: var(--ok-bg); color: var(--ok); }
 .badge-rejected { background: #e5e7eb; color: #4b5563; }
+.badge-retracted { background: var(--bad-bg); color: var(--bad); }
 .badge-withdrawn { background: #fce7f3; color: #9d174d; text-decoration: line-through; }
 .badge-published { background: var(--ok-bg); color: var(--ok); }
 .badge-head { background: var(--info-bg); color: #1e40af; }

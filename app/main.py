@@ -95,6 +95,10 @@ class RevIn(BaseModel):
     expected_rev: int
 
 
+class RetractionIn(BaseModel):
+    reason: str = Field(min_length=1, max_length=500)
+
+
 # ---------- 组装返回数据 ----------
 
 def _proposal_flags(p: sqlite3.Row, user: sqlite3.Row, editable: bool) -> dict:
@@ -121,8 +125,18 @@ def _proposal_flags(p: sqlite3.Row, user: sqlite3.Row, editable: bool) -> dict:
 
 def build_version_detail(conn: sqlite3.Connection, vid: int, user: sqlite3.Row) -> dict:
     v = conn.execute(
-        """SELECT v.*, d.title AS document_title, d.author_id AS document_author_id
-           FROM versions v JOIN documents d ON d.id=v.document_id WHERE v.id=?""",
+        """SELECT v.*, d.title AS document_title, d.author_id AS document_author_id,
+                  pub.id AS publication_id, pub.retraction_reason,
+                  pub.retraction_requested_by, pub.retraction_requested_at,
+                  pub.retraction_confirmed_by, pub.retraction_confirmed_at,
+                  ru.display_name AS retraction_requested_name,
+                  cu.display_name AS retraction_confirmed_name
+           FROM versions v
+           JOIN documents d ON d.id=v.document_id
+           LEFT JOIN publications pub ON pub.version_id=v.id
+           LEFT JOIN users ru ON ru.id=pub.retraction_requested_by
+           LEFT JOIN users cu ON cu.id=pub.retraction_confirmed_by
+           WHERE v.id=?""",
         (vid,),
     ).fetchone()
     if not v:
@@ -167,6 +181,11 @@ def build_version_detail(conn: sqlite3.Connection, vid: int, user: sqlite3.Row) 
         "SELECT head_version_id FROM documents WHERE id=?", (v["document_id"],)
     ).fetchone()["head_version_id"] == vid
     published = v["published_at"] is not None
+    retraction_status = "none"
+    if v["retraction_confirmed_at"] is not None:
+        retraction_status = "retracted"
+    elif v["retraction_requested_at"] is not None:
+        retraction_status = "retraction_pending"
 
     return {
         "id": v["id"],
@@ -178,6 +197,15 @@ def build_version_detail(conn: sqlite3.Connection, vid: int, user: sqlite3.Row) 
         "content_length": v["content_len"],
         "is_head": is_head,
         "published_at": v["published_at"],
+        "publication_id": v["publication_id"],
+        "retraction_status": retraction_status,
+        "retraction_reason": v["retraction_reason"],
+        "retraction_requested_by": v["retraction_requested_by"],
+        "retraction_requested_by_name": v["retraction_requested_name"],
+        "retraction_requested_at": v["retraction_requested_at"],
+        "retraction_confirmed_by": v["retraction_confirmed_by"],
+        "retraction_confirmed_by_name": v["retraction_confirmed_name"],
+        "retraction_confirmed_at": v["retraction_confirmed_at"],
         "created_at": v["created_at"],
         "proposals": [
             _proposal_flags(p, user, is_head and not published)
@@ -209,6 +237,78 @@ def build_version_detail(conn: sqlite3.Connection, vid: int, user: sqlite3.Row) 
             and distinct_confirmers >= 2
         ),
     }
+
+
+def _get_publication_row(conn: sqlite3.Connection, publication_id: int, user_id: int) -> sqlite3.Row:
+    row = conn.execute(
+        """SELECT pub.*, d.title AS document_title, d.author_id AS document_author_id,
+                  v.version_no,
+                  pu.display_name AS published_by_name,
+                  ru.display_name AS retraction_requested_name,
+                  cu.display_name AS retraction_confirmed_name,
+                  sv.viewed_at AS my_snapshot_viewed_at,
+                  sv.retraction_requested_at AS my_view_for_requested_at
+           FROM publications pub
+           JOIN documents d ON d.id=pub.document_id
+           JOIN versions v ON v.id=pub.version_id
+           JOIN users pu ON pu.id=pub.published_by
+           LEFT JOIN users ru ON ru.id=pub.retraction_requested_by
+           LEFT JOIN users cu ON cu.id=pub.retraction_confirmed_by
+           LEFT JOIN publication_snapshot_views sv
+                  ON sv.publication_id=pub.id AND sv.reviewer_id=?
+           WHERE pub.id=?""",
+        (user_id, publication_id),
+    ).fetchone()
+    if not row:
+        raise APIError(404, "发布记录不存在")
+    return row
+
+
+def build_publication(row: sqlite3.Row, user: sqlite3.Row, include_snapshot: bool = False) -> dict:
+    if row["retraction_confirmed_at"] is not None:
+        status = "retracted"
+    elif row["retraction_requested_at"] is not None:
+        status = "retraction_pending"
+    else:
+        status = "active"
+
+    snapshot_viewed = (
+        row["retraction_requested_at"] is not None
+        and row["my_view_for_requested_at"] == row["retraction_requested_at"]
+    )
+    is_document_author = user["role"] == "author" and user["id"] == row["document_author_id"]
+    can_confirm = (
+        status == "retraction_pending"
+        and user["role"] == "reviewer"
+        and user["id"] != row["document_id"]
+        and user["id"] != row["retraction_requested_by"]
+        and snapshot_viewed
+    )
+    result = {
+        "id": row["id"],
+        "document_id": row["document_id"],
+        "document_title": row["document_title"],
+        "version_id": row["version_id"],
+        "version_no": row["version_no"],
+        "published_by": row["published_by"],
+        "published_by_name": row["published_by_name"],
+        "published_at": row["created_at"],
+        "created_at": row["created_at"],
+        "status": status,
+        "retraction_reason": row["retraction_reason"],
+        "retraction_requested_by": row["retraction_requested_by"],
+        "retraction_requested_name": row["retraction_requested_name"],
+        "retraction_requested_at": row["retraction_requested_at"],
+        "retraction_confirmed_by": row["retraction_confirmed_by"],
+        "retraction_confirmed_name": row["retraction_confirmed_name"],
+        "retraction_confirmed_at": row["retraction_confirmed_at"],
+        "snapshot_viewed": snapshot_viewed,
+        "can_request_retraction": status == "active" and is_document_author,
+        "can_confirm_retraction": can_confirm,
+    }
+    if include_snapshot:
+        result["masked_snapshot"] = row["masked_text"]
+    return result
 
 
 def _lock_version(conn: sqlite3.Connection, vid: int, expected_rev: int) -> sqlite3.Row:
@@ -279,10 +379,13 @@ def list_documents(conn: sqlite3.Connection = Depends(get_db), user: sqlite3.Row
                   u.display_name AS author_name,
                   hv.version_no AS head_version_no,
                   hv.published_at AS head_published_at,
+                  hv_pub.retraction_requested_at AS head_retraction_requested_at,
+                  hv_pub.retraction_confirmed_at AS head_retraction_confirmed_at,
                   (SELECT COUNT(*) FROM versions vv WHERE vv.document_id=d.id) AS version_count
            FROM documents d
            JOIN users u ON u.id=d.author_id
            LEFT JOIN versions hv ON hv.id=d.head_version_id
+           LEFT JOIN publications hv_pub ON hv_pub.version_id=hv.id
            ORDER BY d.id DESC"""
     ).fetchall()
     return [dict(r) for r in rows]
@@ -330,9 +433,13 @@ def get_document(doc_id: int, conn: sqlite3.Connection = Depends(get_db),
     versions = conn.execute(
         """SELECT v.id, v.version_no, v.state_rev, v.published_at, v.created_at,
                   v.content_len,
+                  pub.id AS publication_id,
+                  pub.retraction_requested_at, pub.retraction_confirmed_at,
                   SUM(CASE WHEN p.status='pending' AND p.withdrawn_at IS NULL THEN 1 ELSE 0 END) AS pending_count,
                   SUM(CASE WHEN p.status='accepted' AND p.withdrawn_at IS NULL THEN 1 ELSE 0 END) AS accepted_count
-           FROM versions v LEFT JOIN proposals p ON p.version_id=v.id
+           FROM versions v
+           LEFT JOIN publications pub ON pub.version_id=v.id
+           LEFT JOIN proposals p ON p.version_id=v.id
            WHERE v.document_id=?
            GROUP BY v.id ORDER BY v.version_no DESC""",
         (doc_id,),
@@ -595,19 +702,156 @@ def publish_version(vid: int, body: RevIn, conn: sqlite3.Connection = Depends(ge
     return build_version_detail(conn, vid, user)
 
 
-# ---------- 导出 / 发布记录 / 待办 ----------
+# ---------- 撤稿 / 发布记录 / 导出 ----------
+
+@app.get("/api/publications")
+def list_publications(conn: sqlite3.Connection = Depends(get_db),
+                      user: sqlite3.Row = Depends(current_user)):
+    """发布记录保留完整历史；状态字段区分可用、撤稿待确认和已撤稿。"""
+    rows = conn.execute(
+        """SELECT pub.*, d.title AS document_title, d.author_id AS document_author_id,
+                  v.version_no, pu.display_name AS published_by_name,
+                  ru.display_name AS retraction_requested_name,
+                  cu.display_name AS retraction_confirmed_name,
+                  sv.viewed_at AS my_snapshot_viewed_at,
+                  sv.retraction_requested_at AS my_view_for_requested_at
+           FROM publications pub
+           JOIN documents d ON d.id=pub.document_id
+           JOIN versions v ON v.id=pub.version_id
+           JOIN users pu ON pu.id=pub.published_by
+           LEFT JOIN users ru ON ru.id=pub.retraction_requested_by
+           LEFT JOIN users cu ON cu.id=pub.retraction_confirmed_by
+           LEFT JOIN publication_snapshot_views sv
+                  ON sv.publication_id=pub.id AND sv.reviewer_id=?
+           ORDER BY pub.id DESC""",
+        (user["id"],),
+    ).fetchall()
+    return [build_publication(r, user) for r in rows]
+
+
+@app.get("/api/publications/{pid}")
+def get_publication(pid: int, conn: sqlite3.Connection = Depends(get_db),
+                    user: sqlite3.Row = Depends(current_user)):
+    return build_publication(_get_publication_row(conn, pid, user["id"]), user)
+
+
+@app.get("/api/publications/{pid}/snapshot")
+def publication_snapshot(pid: int, conn: sqlite3.Connection = Depends(get_db),
+                         user: sqlite3.Row = Depends(current_user)):
+    """查看发布时冻结的脱敏快照；审阅人打开时留下确认前已查看的审计记录。"""
+    row = _get_publication_row(conn, pid, user["id"])
+    if user["role"] == "reviewer":
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """INSERT INTO publication_snapshot_views
+                       (publication_id, reviewer_id, viewed_at, retraction_requested_at)
+                   VALUES (?, ?, datetime('now'), ?)
+                   ON CONFLICT(publication_id, reviewer_id)
+                   DO UPDATE SET viewed_at=datetime('now'),
+                                 retraction_requested_at=excluded.retraction_requested_at""",
+                (pid, user["id"], row["retraction_requested_at"]),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        row = _get_publication_row(conn, pid, user["id"])
+    return build_publication(row, user, include_snapshot=True)
+
+
+@app.post("/api/publications/{pid}/retraction/request")
+def request_retraction(pid: int, body: RetractionIn, conn: sqlite3.Connection = Depends(get_db),
+                       user: sqlite3.Row = Depends(current_user)):
+    """文稿作者只能对仍可用的指定发布记录发起撤稿；确认前发布稿继续可用。"""
+    require_role(user, "author")
+    reason = body.reason.strip()
+    if not reason:
+        raise APIError(400, "撤稿原因不能为空")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _get_publication_row(conn, pid, user["id"])
+        if user["id"] != row["document_author_id"]:
+            raise APIError(403, "只有文稿作者可以发起撤稿")
+        if row["retraction_confirmed_at"] is not None:
+            raise APIError(409, "该发布记录已撤稿，不能重复发起")
+        if row["retraction_requested_at"] is not None:
+            raise APIError(409, "该发布记录已在撤稿确认中，不能重复发起")
+        cur = conn.execute(
+            """UPDATE publications
+               SET retraction_reason=?, retraction_requested_by=?, retraction_requested_at=datetime('now')
+               WHERE id=? AND retraction_requested_at IS NULL AND retraction_confirmed_at IS NULL""",
+            (reason, user["id"], pid),
+        )
+        if cur.rowcount != 1:
+            raise APIError(409, "撤稿状态已变化，请刷新页面后重试")
+        conn.execute("COMMIT")
+    except APIError:
+        conn.execute("ROLLBACK")
+        raise
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return build_publication(_get_publication_row(conn, pid, user["id"]), user)
+
+
+@app.post("/api/publications/{pid}/retraction/confirm")
+def confirm_retraction(pid: int, conn: sqlite3.Connection = Depends(get_db),
+                       user: sqlite3.Row = Depends(current_user)):
+    """另一名非作者审阅人在查看快照后确认；条件更新保证并发确认只生效一次。"""
+    require_role(user, "reviewer")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _get_publication_row(conn, pid, user["id"])
+        if row["retraction_confirmed_at"] is not None:
+            raise APIError(409, "该发布记录已撤稿，不能重复确认")
+        if row["retraction_requested_at"] is None:
+            raise APIError(409, "该发布记录尚无撤稿请求，不能确认")
+        if user["id"] == row["document_author_id"] or user["id"] == row["retraction_requested_by"]:
+            raise APIError(403, "作者不能自批撤稿，须由另一名非作者审阅人确认")
+        viewed = conn.execute(
+            """SELECT 1 FROM publication_snapshot_views
+               WHERE publication_id=? AND reviewer_id=? AND retraction_requested_at=?""",
+            (pid, user["id"], row["retraction_requested_at"]),
+        ).fetchone()
+        if not viewed:
+            raise APIError(409, "请先查看该记录的脱敏快照后再确认撤稿")
+        cur = conn.execute(
+            """UPDATE publications
+               SET retraction_confirmed_by=?, retraction_confirmed_at=datetime('now')
+               WHERE id=? AND retraction_requested_at IS NOT NULL AND retraction_confirmed_at IS NULL""",
+            (user["id"], pid),
+        )
+        if cur.rowcount != 1:
+            raise APIError(409, "撤稿状态已变化或已被确认，请刷新页面后重试")
+        conn.execute("COMMIT")
+    except APIError:
+        conn.execute("ROLLBACK")
+        raise
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    return build_publication(_get_publication_row(conn, pid, user["id"]), user)
+
+
+# ---------- 导出 / 待办 ----------
 
 @app.get("/api/versions/{vid}/export")
 def export_version(vid: int, conn: sqlite3.Connection = Depends(get_db),
                    user: sqlite3.Row = Depends(current_user)):
     """导出永远只包含遮盖后的文本（接受范围的并集），任何情况下都不返回原文。"""
     v = conn.execute(
-        """SELECT v.*, d.title AS document_title FROM versions v
-           JOIN documents d ON d.id=v.document_id WHERE v.id=?""",
+        """SELECT v.*, d.title AS document_title, pub.retraction_confirmed_at
+           FROM versions v
+           JOIN documents d ON d.id=v.document_id
+           LEFT JOIN publications pub ON pub.version_id=v.id
+           WHERE v.id=?""",
         (vid,),
     ).fetchone()
     if not v:
         raise APIError(404, "版本不存在")
+    if v["retraction_confirmed_at"] is not None:
+        raise APIError(409, "该发布记录已撤稿，不能再通过原导出入口下载；可在发布记录中查看历史快照")
     if v["published_at"] is None:
         pending = conn.execute(
             "SELECT COUNT(*) AS c FROM proposals"
@@ -629,29 +873,13 @@ def export_version(vid: int, conn: sqlite3.Connection = Depends(get_db),
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
-
-@app.get("/api/publications")
-def list_publications(conn: sqlite3.Connection = Depends(get_db),
-                      user: sqlite3.Row = Depends(current_user)):
-    rows = conn.execute(
-        """SELECT p.id, p.document_id, p.version_id, p.created_at,
-                  d.title AS document_title, v.version_no,
-                  u.display_name AS published_by_name
-           FROM publications p
-           JOIN documents d ON d.id=p.document_id
-           JOIN versions v ON v.id=p.version_id
-           JOIN users u ON u.id=p.published_by
-           ORDER BY p.id DESC"""
-    ).fetchall()
-    return [dict(r) for r in rows]
-
-
 @app.get("/api/todos")
 def todos(conn: sqlite3.Connection = Depends(get_db), user: sqlite3.Row = Depends(current_user)):
     result = {
         "awaiting_my_decision": [],
         "my_open_proposals": [],
         "awaiting_my_confirmation": [],
+        "awaiting_my_retraction_confirmation": [],
         "ready_to_publish": [],
     }
     if user["role"] == "reviewer":
@@ -706,6 +934,30 @@ def todos(conn: sqlite3.Connection = Depends(get_db), user: sqlite3.Row = Depend
             item["confirmer_count"] = _count_confirmers(conn, r["version_id"], sha)
             items.append(item)
         result["awaiting_my_confirmation"] = items
+        result["awaiting_my_retraction_confirmation"] = [
+            build_publication(r, user) for r in conn.execute(
+                """SELECT pub.*, d.title AS document_title, d.author_id AS document_author_id,
+                          v.version_no, pu.display_name AS published_by_name,
+                          ru.display_name AS retraction_requested_name,
+                          cu.display_name AS retraction_confirmed_name,
+                          sv.viewed_at AS my_snapshot_viewed_at,
+                  sv.retraction_requested_at AS my_view_for_requested_at
+                   FROM publications pub
+                   JOIN documents d ON d.id=pub.document_id
+                   JOIN versions v ON v.id=pub.version_id
+                   JOIN users pu ON pu.id=pub.published_by
+                   LEFT JOIN users ru ON ru.id=pub.retraction_requested_by
+                   LEFT JOIN users cu ON cu.id=pub.retraction_confirmed_by
+                   LEFT JOIN publication_snapshot_views sv
+                          ON sv.publication_id=pub.id AND sv.reviewer_id=?
+                   WHERE pub.retraction_requested_at IS NOT NULL
+                     AND pub.retraction_confirmed_at IS NULL
+                     AND pub.retraction_requested_by != ?
+                     AND d.author_id != ?
+                   ORDER BY pub.retraction_requested_at""",
+                (user["id"], user["id"], user["id"]),
+            ).fetchall()
+        ]
     else:
         result["ready_to_publish"] = [dict(r) for r in conn.execute(
             """SELECT v.id AS version_id, v.document_id AS doc_id, d.title AS document_title,

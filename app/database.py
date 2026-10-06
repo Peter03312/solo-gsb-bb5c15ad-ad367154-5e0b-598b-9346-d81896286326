@@ -71,9 +71,32 @@ CREATE TABLE IF NOT EXISTS publications (
     document_id  INTEGER NOT NULL REFERENCES documents(id),
     masked_text  TEXT NOT NULL,
     published_by INTEGER NOT NULL REFERENCES users(id),
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    -- 撤稿分两步：作者发起（写入 requested_*），另一名非作者审阅人确认后写入 confirmed_*。
+    retraction_reason        TEXT,
+    retraction_requested_by  INTEGER REFERENCES users(id),
+    retraction_requested_at  TEXT,
+    retraction_confirmed_by  INTEGER REFERENCES users(id),
+    retraction_confirmed_at  TEXT
+);
+
+-- 审阅人打开撤稿记录当时脱敏快照的审计痕迹；确认前必须先查看。
+CREATE TABLE IF NOT EXISTS publication_snapshot_views (
+    publication_id INTEGER NOT NULL REFERENCES publications(id),
+    reviewer_id    INTEGER NOT NULL REFERENCES users(id),
+    viewed_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    -- 标记这次查看对应的撤稿请求，避免请求前查看（即使时间同秒）被算作确认前查看。
+    retraction_requested_at TEXT,
+    PRIMARY KEY (publication_id, reviewer_id)
 );
 """
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    """为已有 SQLite 数据库补列；新库的 SCHEMA 已包含该列时跳过。"""
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def connect() -> sqlite3.Connection:
@@ -94,6 +117,23 @@ def init_db() -> None:
     conn = connect()
     try:
         conn.executescript(SCHEMA)
+        _ensure_column(conn, "publications", "retraction_reason", "retraction_reason TEXT")
+        _ensure_column(
+            conn, "publications", "retraction_requested_by",
+            "retraction_requested_by INTEGER REFERENCES users(id)",
+        )
+        _ensure_column(conn, "publications", "retraction_requested_at", "retraction_requested_at TEXT")
+        _ensure_column(
+            conn, "publications", "retraction_confirmed_by",
+            "retraction_confirmed_by INTEGER REFERENCES users(id)",
+        )
+        _ensure_column(conn, "publications", "retraction_confirmed_at", "retraction_confirmed_at TEXT")
+        _ensure_column(
+            conn,
+            "publication_snapshot_views",
+            "retraction_requested_at",
+            "retraction_requested_at TEXT",
+        )
         if conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"] == 0:
             seeds = [
                 (config.SEED_AUTHOR_USER, "作者", "author", config.SEED_AUTHOR_PASS),
